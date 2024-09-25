@@ -198,8 +198,11 @@ KeyError: 'qwen2_vl'
 We offer a toolkit to help you handle various types of visual input more conveniently, as if you were using an API. This includes base64, URLs, and interleaved images and videos. You can install it using the following command:
 
 ```bash
-pip install qwen-vl-utils
+# It's highly recommanded to use `[decord]` feature for faster video loading.
+pip install qwen-vl-utils[decord]
 ```
+
+If you are not using Linux, you might not be able to install `decord` from PyPI. In that case, you can use `pip install qwen-vl-utils` which will fall back to using torchvision for video processing. However, you can still [install decord from source](https://github.com/dmlc/decord?tab=readme-ov-file#install-from-source) to get decord used when loading video.
 
 ### Using 🤗  Transformers to Chat
 
@@ -327,14 +330,13 @@ messages = [
                     "file:///path/to/frame3.jpg",
                     "file:///path/to/frame4.jpg",
                 ],
-                "fps": 1.0,
             },
             {"type": "text", "text": "Describe this video."},
         ],
     }
 ]
 
-# Messages containing a video and a text query
+# Messages containing a local video path and a text query
 messages = [
     {
         "role": "user",
@@ -344,6 +346,20 @@ messages = [
                 "video": "file:///path/to/video1.mp4",
                 "max_pixels": 360 * 420,
                 "fps": 1.0,
+            },
+            {"type": "text", "text": "Describe this video."},
+        ],
+    }
+]
+
+# Messages containing a video url and a text query
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "video",
+                "video": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-VL/space_woaudio.mp4",
             },
             {"type": "text", "text": "Describe this video."},
         ],
@@ -374,6 +390,14 @@ output_text = processor.batch_decode(
 )
 print(output_text)
 ```
+
+Video URL compatibility largely depends on the third-party library version. The details are in the table below. change the backend by `FORCE_QWENVL_VIDEO_READER=torchvision` or `FORCE_QWENVL_VIDEO_READER=decord` if you prefer not to use the default one.
+
+| Backend     | HTTP | HTTPS |
+|-------------|------|-------|
+| torchvision >= 0.19.0 | ✅  | ✅   |
+| torchvision < 0.19.0  | ❌  | ❌   |
+| decord      | ✅  | ❌   |
 </details>
 
 <details>
@@ -1165,6 +1189,43 @@ chat_response = client.chat.completions.create(
                     "type": "image_url",
                     "image_url": {
                         "url": "https://modelscope.oss-cn-beijing.aliyuncs.com/resource/qwen.png"
+                    },
+                },
+                {"type": "text", "text": "What is the text in the illustrate?"},
+            ],
+        },
+    ],
+)
+print("Chat response:", chat_response)
+```
+
+You can also upload base64-encoded local images (see [OpenAI API protocol document](https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images) for more details):
+```python
+import base64
+from openai import OpenAI
+# Set OpenAI's API key and API base to use vLLM's API server.
+openai_api_key = "EMPTY"
+openai_api_base = "http://localhost:8000/v1"
+client = OpenAI(
+    api_key=openai_api_key,
+    base_url=openai_api_base,
+)
+image_path = "/path/to/local/image.png"
+with open(image_path, "rb") as f:
+    encoded_image = base64.b64encode(f.read())
+encoded_image_text = encoded_image.decode("utf-8")
+base64_qwen = f"data:image;base64,{encoded_image_text}"
+chat_response = client.chat.completions.create(
+    model="Qwen2-7B-Instruct",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": base64_qwen
                     },
                 },
                 {"type": "text", "text": "What is the text in the illustrate?"},
