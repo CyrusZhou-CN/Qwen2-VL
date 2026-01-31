@@ -1,3 +1,8 @@
+"""
+Evaluation utilities for VideoMME benchmark.
+Contains functions for answer extraction and evaluation.
+"""
+
 import os
 import requests
 import time
@@ -8,7 +13,25 @@ import traceback
 import pandas as pd
 from PIL import Image
 from typing import List, Dict, Tuple, Any
-from common_utils import encode_image_to_base64
+
+def encode_image_to_base64(image, target_size=None):
+    """Encode an image to base64 string."""
+    import base64
+    import io
+    
+    if target_size is not None:
+        width, height = image.size
+        if width > height:
+            new_width = target_size
+            new_height = int(height * target_size / width)
+        else:
+            new_height = target_size
+            new_width = int(width * target_size / height)
+        image = image.resize((new_width, new_height))
+    
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 class OpenAIWrapper:
     """Wrapper for OpenAI API."""
@@ -201,7 +224,6 @@ def can_infer_option(answer, choices):
     if count == 1:
         for ch in choices:
             if 'A' in splits and len(splits) > 3:
-                # print(f'A might be a quantifier in the string: {answer}.')
                 return False
             if ch in splits:
                 return ch
@@ -231,6 +253,7 @@ def can_infer(answer, choices):
     return copt if copt else can_infer_text(answer, choices)
 
 def build_choices(item):
+    """Build choices dictionary from item."""
     ret = {}
     for ch in string.ascii_uppercase:
         if ch in item and (not pd.isna(item[ch])):
@@ -238,6 +261,7 @@ def build_choices(item):
     return ret
 
 def build_option_str(option_dict):
+    """Build option string from dictionary."""
     s = 'There are several options: \n'
     for c, content in option_dict.items():
         if not pd.isna(content):
@@ -245,6 +269,7 @@ def build_option_str(option_dict):
     return s
 
 def build_prompt(question, options, prediction):
+    """Build prompt for judge model."""
     tmpl = (
         'You are an AI assistant who will help me to match '
         'an answer with several options of a single-choice question. '
@@ -286,12 +311,13 @@ def extract_answer_from_item(model, item, wait=5):
     # If rule-based extraction fails, use model-based extraction
     print(f"Rule extract failed. Use model-based extraction.")
     if model is None:
-       assert model is not None, 'Judge model is None for MMMU_DEV_VAL !!!'
+       assert model is not None, 'Judge model is None for VideoMME !!!'
     
     # Try model-based extraction with retries
     retry = 25
     while retry:
-        ans = model.generate([{"type": "text", "value": prompt}])
+        messages_for_judge = [{'type': 'text', 'value': prompt}]
+        ans = model.generate(messages_for_judge)
         if 'Failed to obtain answer via API' in ans:
             print('API failed to answer.')
         else:
@@ -318,17 +344,20 @@ def eval_single_sample(args):
     result = extract_answer_from_item(model, item)
     
     # Determine if the answer is correct
-    hit = 1 if result['opt'] == item['GT'] else 0
+    hit = 1 if result['opt'] == item['answer'] else 0
     
     return {
         "index": item['index'],
-        "split": item['split'],
+        "question_id": item['question_id'],
         "question": item['question'],
+        "domain": item['category'],
+        "sub_category": item['sub_category'],
         "prediction": item['prediction'],
         "extracted_answer": result['opt'],
         "extraction_method": result['extract_model'],
         "extraction_success": result['extract_flag'],
         "extraction_log": result['log'],
-        "gt": item['GT'],
+        "gt": item['answer'],
         "hit": hit
     }
+

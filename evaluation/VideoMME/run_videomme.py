@@ -18,60 +18,11 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor
 
 # Local imports from refactored files
-from dataset_utils import load_dataset, dump_image, MMMU_preproc
+from dataset_utils import load_videomme_dataset, build_videomme_prompt
 from eval_utils import build_judge, eval_single_sample
 
 # Set vLLM multiprocessing method
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-
-def build_mmmu_prompt(line, dump_image_func, dataset):
-    """Build MMMU dataset prompt with standard resolution settings."""
-    # Standard resolution settings
-    MIN_PIXELS = 1280*28*28  # ~1M pixels
-    MAX_PIXELS = 5120*28*28  # ~4M pixels
-    
-    tgt_path = dump_image_func(line)
-    question = line['question']
-    options = {cand: line[cand] for cand in string.ascii_uppercase if cand in line and not pd.isna(line[cand])}
-    options_prompt = 'Options:\n'
-    for key, item in options.items():
-        options_prompt += f'{key}. {item}\n'
-    hint = line['hint'] if ('hint' in line and not pd.isna(line['hint'])) else None
-    prompt = ''
-    if hint is not None:
-        prompt += f'Hint: {hint}\n'
-    prompt += f'Question: {question}\n'
-    if len(options):
-        prompt += options_prompt
-        prompt += 'Please select the correct answer from the options above. \n'
-    prompt = prompt.rstrip()
-    
-    # Build messages in standard conversation format
-    content = []
-    if isinstance(tgt_path, list):
-        for p in tgt_path:
-            content.append({
-                "type": "image",
-                "image": p,
-                "min_pixels": MIN_PIXELS,
-                "max_pixels": MAX_PIXELS
-            })
-    else:
-        content.append({
-            "type": "image", 
-            "image": tgt_path,
-            "min_pixels": MIN_PIXELS,
-            "max_pixels": MAX_PIXELS
-        })
-    content.append({"type": "text", "text": prompt})
-    
-    # Return messages in standard conversation format
-    messages = [{
-        "role": "user",
-        "content": content
-    }]
-    
-    return messages
 
 def prepare_inputs_for_vllm(messages, processor):
     """
@@ -107,31 +58,29 @@ def prepare_inputs_for_vllm(messages, processor):
     }
 
 def run_inference(args):
-    """Run inference on the MMMU dataset using vLLM."""
+    """Run inference on the VideoMME dataset using vLLM."""
     print("\n" + "="*80)
-    print("🚀 MMMU Inference with vLLM (High-Speed Mode)")
+    print("🚀 VideoMME Inference with vLLM (High-Speed Mode)")
     print("="*80 + "\n")
     
     # Load dataset
-    data = load_dataset(args.dataset)
-    print(f"✓ Loaded {len(data)} samples from {args.dataset}")
+    data = load_videomme_dataset(args.data_dir, duration=args.duration)
+    print(f"✓ Loaded {len(data)} samples from VideoMME (duration={args.duration})")
     
-    # Set up image root directory
-    img_root = os.path.join(os.environ['LMUData'], 'images', 'MMMU')
-    os.makedirs(img_root, exist_ok=True)
-    
-    # Set up dump_image function
-    def dump_image_func(line):
-        return dump_image(line, img_root)
+    # Limit samples for testing if specified
+    if args.max_samples is not None and args.max_samples > 0:
+        data = data[:args.max_samples]
+        print(f"⚠️  Testing mode: Processing only first {len(data)} samples")
     
     # Create output directory
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
 
-    # Set up CoT prompt if enabled
-    cot_prompt = ""
-    if args.use_cot:
-        cot_prompt = args.cot_prompt if args.cot_prompt else " If you are uncertain or the problem is too complex, make a reasoned guess based on the information provided. Avoid repeating steps indefinitely—provide your best guess even if unsure. Determine whether to think step by step based on the difficulty of the question, considering all relevant information before answering."
-        print(f"✓ Using CoT prompt: {cot_prompt[:50]}...")
+    # Load system prompt if provided
+    sys_prompt = None
+    if args.sys_prompt and os.path.exists(args.sys_prompt):
+        with open(args.sys_prompt, 'r') as f:
+            sys_prompt = f.read().strip()
+        print(f"✓ Loaded system prompt from {args.sys_prompt}")
 
     # Set up generation parameters (vLLM SamplingParams format)
     sampling_params = SamplingParams(
@@ -149,6 +98,13 @@ def run_inference(args):
     print(f"   temperature={sampling_params.temperature}, top_p={sampling_params.top_p}, top_k={sampling_params.top_k}")
     print(f"   repetition_penalty={sampling_params.repetition_penalty}")
     print(f"   presence_penalty={sampling_params.presence_penalty}")
+    
+    print(f"\n⚙️  Video processing parameters:")
+    print(f"   fps={args.fps}")
+    print(f"   min_pixels={args.min_pixels}, max_pixels={args.max_pixels}")
+    print(f"   min_frames={args.min_frames}, max_frames={args.max_frames}")
+    print(f"   total_pixels={args.total_pixels}")
+    print(f"   use_subtitle={args.use_subtitle}")
     
     if sampling_params.presence_penalty > 0:
         print(f"   ✅ Anti-repetition enabled (presence_penalty={sampling_params.presence_penalty})")
@@ -175,40 +131,37 @@ def run_inference(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=True,
         max_model_len=args.max_model_len,
-        limit_mm_per_prompt={"image": args.max_images_per_prompt},
-        seed=42,
+        limit_mm_per_prompt={"video": args.max_videos_per_prompt},
+        seed=args.seed,
     )
     print("✓ vLLM initialized successfully\n")
     
     # Prepare all inputs
     print("Preparing inputs for vLLM...")
     all_inputs = []
-    all_line_dicts = []
+    all_annotations = []
     all_messages = []
     
-    for idx, (_, line) in enumerate(tqdm(data.iterrows(), total=len(data), desc="Building prompts")):
-        # Convert line to dict
-        line_dict = line.to_dict()
-        for k, v in line_dict.items():
-            if isinstance(v, np.integer):
-                line_dict[k] = int(v)
-            elif isinstance(v, np.floating):
-                line_dict[k] = float(v)
-        
+    for idx, data_item in enumerate(tqdm(data, desc="Building prompts")):
         # Build prompt
-        messages = build_mmmu_prompt(line, dump_image_func, args.dataset)
-        
-        # Add CoT prompt
-        if args.use_cot and len(messages) > 0 and len(messages[0]['content']) > 0:
-            last_content = messages[0]['content'][-1]
-            if last_content['type'] == 'text':
-                last_content['text'] += cot_prompt
+        messages, annotation = build_videomme_prompt(
+            data_item, 
+            args.data_dir,
+            use_subtitle=args.use_subtitle,
+            fps=args.fps,
+            min_frames=args.min_frames,
+            max_frames=args.max_frames,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            total_pixels=args.total_pixels,
+            sys_prompt=sys_prompt
+        )
         
         # Prepare input for vLLM
         vllm_input = prepare_inputs_for_vllm(messages, processor)
         
         all_inputs.append(vllm_input)
-        all_line_dicts.append(line_dict)
+        all_annotations.append(annotation)
         all_messages.append(messages)
     
     print(f"✓ Prepared {len(all_inputs)} inputs\n")
@@ -231,16 +184,16 @@ def run_inference(args):
     print("Saving results...")
     results = []
     
-    for idx, (line_dict, messages, output) in enumerate(zip(all_line_dicts, all_messages, outputs)):
+    for idx, (annotation, messages, output) in enumerate(zip(all_annotations, all_messages, outputs)):
         response = output.outputs[0].text
-        index = line_dict['index']
-
+        
+        # Handle </think> tag if present
         response_final = str(response).split("</think>")[-1].strip()
         
         result = {
-            "question_id": int(index) if isinstance(index, np.integer) else index,
-            "annotation": line_dict,
-            "task": args.dataset,
+            "question_id": annotation['question_id'],
+            "annotation": annotation,
+            "task": f"VideoMME_{args.duration}_{'w_subtitle' if args.use_subtitle else 'wo_subtitle'}",
             "result": {"gen": response_final, "gen_raw": response},
             "messages": messages
         }
@@ -263,38 +216,20 @@ def run_evaluation(args):
             job = json.loads(line)
             annotation = job["annotation"]
             annotation["prediction"] = job["result"]["gen"]
+            annotation["index"] = job["question_id"]
+            annotation["category"] = annotation["domain"]
             results.append(annotation)
             
     data = pd.DataFrame.from_records(results)
     data = data.sort_values(by='index')
     data['prediction'] = [str(x) for x in data['prediction']]
-    # If not choice label, then use lower case
-    for k in data.keys():
-        data[k.lower() if k not in list(string.ascii_uppercase) else k] = data.pop(k)
-
-    # Load dataset
-    meta = load_dataset(args.dataset)
-
-    # Validation
-    print(f"len(data): {len(data)}")
-    print(f"len(meta): {len(meta)}")
-    meta_q_map = {x: y for x, y in zip(meta['index'], meta['question'])}
-    data_map = {x: y for x, y in zip(data['index'], data['question'])}
-    for k in data_map:
-        assert k in meta_q_map, (
-            f'eval_file should be the same as or a subset of dataset MMMU_DEV_VAL'
-        )
-
-    answer_map = {i: c for i, c in zip(meta['index'], meta['answer'])}
-    data = MMMU_preproc(data)
-    answer_map = {k: (v if v in list(string.ascii_uppercase) else 'A') for k, v in answer_map.items()}
-    data = data[data['index'].isin(answer_map)]
-    data['GT'] = [answer_map[idx] for idx in data['index']]
-    items = []
-    for i in range(len(data)):
-        item = data.iloc[i]
-        items.append(item)
-
+    
+    # Build choices columns (A, B, C, D) from annotation
+    for idx, row in data.iterrows():
+        choices = row['choices']
+        for k, v in choices.items():
+            data.at[idx, k] = v
+    
     # Build judge model
     model = build_judge(
         model=getattr(args, 'eval_model', 'gpt-3.5-turbo-0125'),
@@ -303,49 +238,49 @@ def run_evaluation(args):
     
     # Prepare evaluation tasks
     eval_tasks = []
-    for item in items:
+    for idx, item in data.iterrows():
         eval_tasks.append((model, item))
     
     # Run evaluation
     eval_results = []
     
-    # Debug mode: process single-threaded with first few samples
-    debug = os.environ.get('DEBUG', '').lower() == 'true'
-    if debug:
-        print("Running in debug mode with first 5 samples...")
-        for task in eval_tasks[:5]:
-            try:
-                result = eval_single_sample(task)
-                eval_results.append(result)
-            except Exception as e:
-                print(f"Error processing task: {e}")
-                print(f"Task details: {task}")
-                raise
-    else:
-        # Normal mode: process all samples with threading
-        from concurrent.futures import ThreadPoolExecutor
-        nproc = getattr(args, 'nproc', 4)
-        with ThreadPoolExecutor(max_workers=nproc) as executor:
-            for result in tqdm(executor.map(eval_single_sample, eval_tasks), 
-                             total=len(eval_tasks), desc="Evaluating"):
-                eval_results.append(result)
+    # Normal mode: process all samples with threading
+    from concurrent.futures import ThreadPoolExecutor
+    nproc = getattr(args, 'nproc', 4)
+    with ThreadPoolExecutor(max_workers=nproc) as executor:
+        for result in tqdm(executor.map(eval_single_sample, eval_tasks), 
+                         total=len(eval_tasks), desc="Evaluating"):
+            eval_results.append(result)
     
     # Calculate overall accuracy
     accuracy = sum(r['hit'] for r in eval_results) / len(eval_results)
     
-    # Calculate accuracy by split
-    results_by_split = {}
+    # Calculate accuracy by category
+    results_by_category = {}
     for result in eval_results:
-        split = result.get('split', 'unknown')
-        if split not in results_by_split:
-            results_by_split[split] = []
-        results_by_split[split].append(result)
+        category = result.get('domain', 'unknown')
+        if category not in results_by_category:
+            results_by_category[category] = []
+        results_by_category[category].append(result)
     
-    accuracy_by_split = {}
-    for split, split_results in results_by_split.items():
-        split_accuracy = sum(r['hit'] for r in split_results) / len(split_results)
-        accuracy_by_split[split] = split_accuracy
-        print(f"Accuracy for {split} split: {split_accuracy:.4f} ({sum(r['hit'] for r in split_results)}/{len(split_results)})")
+    accuracy_by_category = {}
+    for category, cat_results in results_by_category.items():
+        cat_accuracy = sum(r['hit'] for r in cat_results) / len(cat_results)
+        accuracy_by_category[category] = cat_accuracy
+        print(f"Accuracy for {category}: {cat_accuracy:.4f} ({sum(r['hit'] for r in cat_results)}/{len(cat_results)})")
+    
+    # Calculate accuracy by sub_category
+    results_by_subcategory = {}
+    for result in eval_results:
+        sub_category = result.get('sub_category', 'unknown')
+        if sub_category not in results_by_subcategory:
+            results_by_subcategory[sub_category] = []
+        results_by_subcategory[sub_category].append(result)
+    
+    accuracy_by_subcategory = {}
+    for sub_category, subcat_results in results_by_subcategory.items():
+        subcat_accuracy = sum(r['hit'] for r in subcat_results) / len(subcat_results)
+        accuracy_by_subcategory[sub_category] = subcat_accuracy
     
     # Save results
     output_df = pd.DataFrame(eval_results)
@@ -355,8 +290,13 @@ def run_evaluation(args):
     with open(args.output_file.replace('.csv', '_acc.json'), 'w') as f:
         json.dump({
             "overall_accuracy": accuracy,
-            "accuracy_by_split": accuracy_by_split
+            "accuracy_by_category": accuracy_by_category,
+            "accuracy_by_subcategory": accuracy_by_subcategory
         }, f, indent=2)
+    
+    # Also save as TSV format (consistent with original implementation)
+    tsv_file = args.output_file.replace('.csv', '.tsv')
+    output_df.to_csv(tsv_file, sep='\t', index=False)
     
     print(f"\n{'='*50}")
     print(f"Evaluation Results:")
@@ -365,17 +305,36 @@ def run_evaluation(args):
     print(f"{'='*50}\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="MMMU Evaluation with vLLM")
+    parser = argparse.ArgumentParser(description="VideoMME Evaluation with vLLM")
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
     # Inference parser
     infer_parser = subparsers.add_parser("infer", help="Run inference with vLLM")
     infer_parser.add_argument("--model-path", type=str, required=True, help="Path to the model")
-    infer_parser.add_argument("--dataset", type=str, default="MMMU_DEV_VAL", help="Dataset name")
-    infer_parser.add_argument("--data-dir", type=str, help="The absolute path of MMMU_DEV_VAL.tsv")
+    infer_parser.add_argument("--data-dir", type=str, required=True, help="VideoMME data directory")
+    infer_parser.add_argument("--duration", type=str, default="short", 
+                            choices=["short", "medium", "long"],
+                            help="Video duration type (short/medium/long)")
+    infer_parser.add_argument("--use-subtitle", action="store_true", 
+                            help="Use subtitles if available")
     infer_parser.add_argument("--output-file", type=str, required=True, help="Output file path")
-    infer_parser.add_argument("--use-cot", action="store_true", help="Use Chain-of-Thought prompting")
-    infer_parser.add_argument("--cot-prompt", type=str, default="", help="Custom Chain-of-Thought prompt")
+    infer_parser.add_argument("--sys-prompt", type=str, default=None, 
+                            help="Path to system prompt file")
+    infer_parser.add_argument("--max-samples", type=int, default=None,
+                            help="Maximum number of samples to process (for testing, default: None = all samples)")
+    
+    # Video processing parameters
+    infer_parser.add_argument("--fps", type=int, default=2, help="Frames per second (default: 2)")
+    infer_parser.add_argument("--min-pixels", type=int, default=128*28*28, 
+                            help="Minimum pixels per frame (default: 128*28*28)")
+    infer_parser.add_argument("--max-pixels", type=int, default=512*28*28,
+                            help="Maximum pixels per frame (default: 512*28*28)")
+    infer_parser.add_argument("--min-frames", type=int, default=4, 
+                            help="Minimum number of frames (default: 4)")
+    infer_parser.add_argument("--max-frames", type=int, default=512,
+                            help="Maximum number of frames (default: 512)")
+    infer_parser.add_argument("--total-pixels", type=int, default=24576*28*28,
+                            help="Total pixels across all frames (default: 24576*28*28)")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None, 
@@ -383,30 +342,30 @@ def main():
     infer_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
                             help="GPU memory utilization (0.0-1.0, default: 0.9)")
     infer_parser.add_argument("--max-model-len", type=int, default=128000,
-                            help="Maximum model context length (default: 128000, balance between performance and memory)")
-    infer_parser.add_argument("--max-images-per-prompt", type=int, default=10,
-                            help="Maximum images per prompt (default: 10)")
+                            help="Maximum model context length (default: 128000)")
+    infer_parser.add_argument("--max-videos-per-prompt", type=int, default=1,
+                            help="Maximum videos per prompt (default: 1)")
+    infer_parser.add_argument("--seed", type=int, default=3407, help="Random seed (default: 3407)")
     
-    # Generation parameters
+    # Generation parameters (aligned with MMMU/RealWorldQA for Instruct model)
     infer_parser.add_argument("--max-new-tokens", type=int, default=32768, 
-                            help="Maximum number of tokens to generate (default: 2048)")
+                            help="Maximum number of tokens to generate (default: 32768)")
     infer_parser.add_argument("--temperature", type=float, default=0.7, 
-                            help="Temperature for sampling (default: 0.7 for greedy-like decoding)")
+                            help="Temperature for sampling (default: 0.7)")
     infer_parser.add_argument("--top-p", type=float, default=0.8, 
-                            help="Top-p for sampling (default: 0.8 for greedy-like decoding)")
+                            help="Top-p for sampling (default: 0.8)")
     infer_parser.add_argument("--top-k", type=int, default=20, 
-                            help="Top-k for sampling (default: 20 for greedy decoding)")
+                            help="Top-k for sampling (default: 20)")
     infer_parser.add_argument("--repetition-penalty", type=float, default=1.0,
-                            help="Repetition penalty (default: 1.0, increase to 1.2-1.5 to reduce repetition)")
+                            help="Repetition penalty (default: 1.0)")
     infer_parser.add_argument("--presence-penalty", type=float, default=1.5,
-                            help="Presence penalty (default: 1.5, range: 0.0-2.0, penalize tokens that have already appeared)")
+                            help="Presence penalty (default: 1.5)")
     
     # Evaluation parser
     eval_parser = subparsers.add_parser("eval", help="Run evaluation")
-    eval_parser.add_argument("--data-dir", type=str, help="The absolute path of MMMU_DEV_VAL.tsv")
+    eval_parser.add_argument("--data-dir", type=str, required=True, help="VideoMME data directory")
     eval_parser.add_argument("--input-file", type=str, required=True, help="Input file with inference results")
     eval_parser.add_argument("--output-file", type=str, required=True, help="Output file path")
-    eval_parser.add_argument("--dataset", type=str, default="MMMU_DEV_VAL", help="Dataset name")
     eval_parser.add_argument("--eval-model", type=str, default="gpt-3.5-turbo-0125",
                             help="Model to use for evaluation (default: gpt-3.5-turbo-0125)")
     eval_parser.add_argument("--api-type", type=str, default="dash", choices=["dash", "mit"],
@@ -414,10 +373,6 @@ def main():
     eval_parser.add_argument("--nproc", type=int, default=4, help="Number of processes to use")
     
     args = parser.parse_args()
-    
-    # Set data directory if provided
-    if hasattr(args, 'data_dir') and args.data_dir:
-        os.environ['LMUData'] = args.data_dir
     
     # Automatically set tensor_parallel_size
     if args.command == 'infer' and args.tensor_parallel_size is None:
@@ -433,3 +388,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
